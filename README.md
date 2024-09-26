@@ -2,9 +2,12 @@
 
 ![MSST-GUI Logo](./images//logo.png)
 
+### This is an early version that uses the terminal to inference
+===================================================================================================================
+
 ## Introduction
 
-MSST-GUI is a Qt5-based inference GUI, designed to provide a convenient and intuitive way to inference (mainly for my own use). At its core, it's a GUI that uses a specified Python environment to add parameters and call `inference.py`. As such, you can also package `msst_gui_en.py` as a smaller executable file and use it in the main repository.[You can find it here.](https://github.com/AliceNavigator/Music-Source-Separation-Training-GUI/releases/tag/v1.3.0)
+MSST-GUI is a Qt5-based inference GUI, designed to provide a convenient and intuitive way to inference (mainly for my own use). At its core, it's a GUI that uses a specified Python environment to add parameters and call `inference.py`. As such, you can also package `msst_gui_en.py` as a [smaller executable file](https://github.com/AliceNavigator/Music-Source-Separation-Training-GUI/releases/latest) and use it in the main repository.
 
 
 ![Main Interface](./images//demo1.png)
