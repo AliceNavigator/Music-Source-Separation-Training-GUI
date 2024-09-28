@@ -2,7 +2,7 @@ import os
 import shutil
 import datetime
 
-DEFAULT_SOURCE_FOLDERS = ['separation_results', 'karaoke_results', 'deverb_results', 'denoise_results', 'input']
+DEFAULT_SOURCE_FOLDERS = ['separation_results', 'karaoke_results', 'deverb_results', 'denoise_results', 'other_results', 'input']
 DEFAULT_DESTINATION_FOLDER = 'archive'
 
 

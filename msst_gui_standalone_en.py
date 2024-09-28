@@ -16,11 +16,19 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QGroupBox, QFormLayout, QLineEdit,
                              QDialog, QTableWidget, QTableWidgetItem, QHeaderView,
                              QTabWidget, QScrollArea, QToolButton, QSizePolicy)
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSize, QTimer, QMutex, QWaitCondition, pyqtSlot, QMetaObject, Q_ARG, QUrl
-from PyQt5.QtGui import QFont, QIcon, QColor, QTextCharFormat, QTextCursor, QPainter, QPixmap, QDesktopServices, QFontInfo
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSize, QTimer, QMutex, QWaitCondition, pyqtSlot, QMetaObject, Q_ARG, \
+    QUrl
+from PyQt5.QtGui import QFont, QIcon, QColor, QTextCharFormat, QTextCursor, QPainter, QPixmap, QDesktopServices, \
+    QFontInfo
 import resources_rc
 from archive import archive_folders
 import tempfile
+import multiprocessing
+from queue import Empty
+import re
+import shlex
+from threading import Lock
+import inference_standalone
 
 os.environ['PYGAME_HIDE_SUPPORT_PROMPT'] = "hide"
 logging.basicConfig(filename='msst_gui.log', level=logging.DEBUG,
@@ -59,17 +67,17 @@ def load_or_create_config():
         initial_config = {
             "vocal_models": {
                 "None": "Do not use vocal separation",
-                "MelBandRoformer_kim.ckpt": "【Recommended】 Slightly better SDR than the other two and halves the time",
+                "MelBandRoformer_kim.ckpt": "\u3010Recommended\u3011 Slightly better SDR than the other two and halves the time",
                 "model_bs_roformer_ep_317_sdr_12.9755.ckpt": "Note: 1297 has slightly higher SDR, but may introduce noise at very high frequencies",
                 "model_bs_roformer_ep_368_sdr_12.9628.ckpt": "1296 version, without the potential high-frequency noise issue"
             },
             "kara_models": {
                 "None": "Do not use harmony separation",
-                "mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956.ckpt": "【Aggressive】 But performs much better than existing UVR models"
+                "mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956.ckpt": "\u3010Aggressive\u3011 But performs much better than existing UVR models"
             },
             "reverb_models": {
                 "None": "Do not use reverb and harmony separation",
-                "dereverb_mel_band_roformer_anvuew_sdr_19.1729.ckpt": "【Recommended】 Currently the highest SDR score",
+                "dereverb_mel_band_roformer_anvuew_sdr_19.1729.ckpt": "\u3010Recommended\u3011 Currently the highest SDR score",
                 "dereverb_mel_band_roformer_less_aggressive_anvuew_sdr_18.8050.ckpt": "Less aggressive than the recommended model",
                 "deverb_bs_roformer_8_384dim_10depth.ckpt": "New bs model trained with more data, higher SDR, more conservative in harmony separation than mel series",
                 "deverb_bs_roformer_8_256dim_8depth.ckpt": "Old bs model",
@@ -77,42 +85,84 @@ def load_or_create_config():
                 "deverb_mel_band_roformer_8_512dim_12depth.ckpt": "Larger network than the 8_256_6 version, slightly higher SDR but 3x inference time",
                 "deverb_mel_band_roformer_ep_27_sdr_10.4567.ckpt": "Initial version, good balance between dereverberation and deharmonization"
             },
-            "denoise_models": {
-                "None": "Do not use denoising",
-                "denoise_mel_band_roformer_aufr33_sdr_27.9959.ckpt": "Use the normal version model with SDR 27.9959",
-                "denoise_mel_band_roformer_aufr33_aggr_sdr_27.9768.ckpt": "Use the aggressive version model with SDR 27.9768"
+            "other_models": {
+                "None": "Do not use other models",
+                "denoise_mel_band_roformer_aufr33_sdr_27.9959.ckpt": "\u3010Denoise\u3011Use the normal version model with SDR 27.9959",
+                "denoise_mel_band_roformer_aufr33_aggr_sdr_27.9768.ckpt": "\u3010Denoise\u3011Use the aggressive version model with SDR 27.9768",
+                "Apollo_LQ_MP3_restoration.ckpt": "\u3010Restoration\u3011Enhancing MP3 audio quality, restoring it to 44.1 kHz",
+                "aspiration_mel_band_roformer_sdr_18.9845.ckpt": "\u3010Aspiration\u3011Aspiration Separation Model",
+                "aspiration_mel_band_roformer_less_aggr_sdr_18.1201.ckpt": "\u3010Aspiration\u3011Less aggr aspiration Separation Model",
+                "mel_band_roformer_crowd_aufr33_viperx_sdr_8.7144.ckpt": "\u3010Crowd\u3011Remove some noisy background crowd sounds, but it will reduce the audio quality."
             },
             "config_paths": {
-                "MelBandRoformer_kim.ckpt": ["configs/config_vocals_mel_band_roformer_kim.yaml",
-                                             "configs/config_vocals_mel_band_roformer_kim-fast.yaml"],
-                "model_bs_roformer_ep_317_sdr_12.9755.ckpt": ["configs/model_bs_roformer_ep_317_sdr_12.9755.yaml",
-                                                              "configs/model_bs_roformer_ep_317_sdr_12.9755-fast.yaml"],
-                "model_bs_roformer_ep_368_sdr_12.9628.ckpt": ["configs/model_bs_roformer_ep_368_sdr_12.9628.yaml",
-                                                              "configs/model_bs_roformer_ep_368_sdr_12.9628-fast.yaml"],
+                "MelBandRoformer_kim.ckpt": [
+                    "configs/config_vocals_mel_band_roformer_kim.yaml",
+                    "configs/config_vocals_mel_band_roformer_kim-fast.yaml"
+                ],
+                "model_bs_roformer_ep_317_sdr_12.9755.ckpt": [
+                    "configs/model_bs_roformer_ep_317_sdr_12.9755.yaml",
+                    "configs/model_bs_roformer_ep_317_sdr_12.9755-fast.yaml"
+                ],
+                "model_bs_roformer_ep_368_sdr_12.9628.ckpt": [
+                    "configs/model_bs_roformer_ep_368_sdr_12.9628.yaml",
+                    "configs/model_bs_roformer_ep_368_sdr_12.9628-fast.yaml"
+                ],
                 "mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956.ckpt": [
                     "configs/config_mel_band_roformer_karaoke.yaml",
-                    "configs/config_mel_band_roformer_karaoke-fast.yaml"],
-                "dereverb_mel_band_roformer_anvuew_sdr_19.1729.ckpt": ["configs/dereverb_mel_band_roformer_anvuew.yaml",
-                                                                       "configs/dereverb_mel_band_roformer_anvuew-fast.yaml"],
+                    "configs/config_mel_band_roformer_karaoke-fast.yaml"
+                ],
+                "dereverb_mel_band_roformer_anvuew_sdr_19.1729.ckpt": [
+                    "configs/dereverb_mel_band_roformer_anvuew.yaml",
+                    "configs/dereverb_mel_band_roformer_anvuew-fast.yaml"
+                ],
                 "dereverb_mel_band_roformer_less_aggressive_anvuew_sdr_18.8050.ckpt": [
                     "configs/dereverb_mel_band_roformer_anvuew.yaml",
-                    "configs/dereverb_mel_band_roformer_anvuew-fast.yaml"],
-                "deverb_bs_roformer_8_384dim_10depth.ckpt": ["configs/deverb_bs_roformer_8_384dim_10depth.yaml",
-                                                             "configs/deverb_bs_roformer_8_384dim_10depth-fast.yaml"],
-                "deverb_bs_roformer_8_256dim_8depth.ckpt": ["configs/deverb_bs_roformer_8_256dim_8depth.yaml",
-                                                            "configs/deverb_bs_roformer_8_256dim_8depth-fast.yaml"],
+                    "configs/dereverb_mel_band_roformer_anvuew-fast.yaml"
+                ],
+                "deverb_bs_roformer_8_384dim_10depth.ckpt": [
+                    "configs/deverb_bs_roformer_8_384dim_10depth.yaml",
+                    "configs/deverb_bs_roformer_8_384dim_10depth-fast.yaml"
+                ],
+                "deverb_bs_roformer_8_256dim_8depth.ckpt": [
+                    "configs/deverb_bs_roformer_8_256dim_8depth.yaml",
+                    "configs/deverb_bs_roformer_8_256dim_8depth-fast.yaml"
+                ],
                 "deverb_mel_band_roformer_8_256dim_6depth.ckpt": [
                     "configs/8_256_6_deverb_mel_band_roformer_8_256dim_6depth.yaml",
-                    "configs/8_256_6_deverb_mel_band_roformer_8_256dim_6depth-fast.yaml"],
+                    "configs/8_256_6_deverb_mel_band_roformer_8_256dim_6depth-fast.yaml"
+                ],
                 "deverb_mel_band_roformer_8_512dim_12depth.ckpt": [
                     "configs/8_512_12_deverb_mel_band_roformer_8_512dim_12depth.yaml",
-                    "configs/8_512_12_deverb_mel_band_roformer_8_512dim_12depth-fast.yaml"],
-                "deverb_mel_band_roformer_ep_27_sdr_10.4567.ckpt": ["configs/deverb_mel_band_roformer.yaml",
-                                                                    "configs/deverb_mel_band_roformer-fast.yaml"],
-                "denoise_mel_band_roformer_aufr33_sdr_27.9959.ckpt": ["configs/model_mel_band_roformer_denoise.yaml",
-                                                                      "configs/model_mel_band_roformer_denoise-fast.yaml"],
+                    "configs/8_512_12_deverb_mel_band_roformer_8_512dim_12depth-fast.yaml"
+                ],
+                "deverb_mel_band_roformer_ep_27_sdr_10.4567.ckpt": [
+                    "configs/deverb_mel_band_roformer.yaml",
+                    "configs/deverb_mel_band_roformer-fast.yaml"
+                ],
+                "denoise_mel_band_roformer_aufr33_sdr_27.9959.ckpt": [
+                    "configs/model_mel_band_roformer_denoise.yaml",
+                    "configs/model_mel_band_roformer_denoise-fast.yaml"
+                ],
                 "denoise_mel_band_roformer_aufr33_aggr_sdr_27.9768.ckpt": [
-                    "configs/model_mel_band_roformer_denoise.yaml", "configs/model_mel_band_roformer_denoise-fast.yaml"]
+                    "configs/model_mel_band_roformer_denoise.yaml",
+                    "configs/model_mel_band_roformer_denoise-fast.yaml"
+                ],
+                "Apollo_LQ_MP3_restoration.ckpt": [
+                    "configs/config_apollo_LQ_MP3_restoration.yaml",
+                    "configs/config_apollo_LQ_MP3_restoration-fast.yaml"
+                ],
+                "aspiration_mel_band_roformer_sdr_18.9845.ckpt": [
+                    "configs/config_aspiration_mel_band_roformer.yaml",
+                    "configs/config_aspiration_mel_band_roformer-fast.yaml"
+                ],
+                "aspiration_mel_band_roformer_less_aggr_sdr_18.1201.ckpt": [
+                    "configs/config_aspiration_mel_band_roformer.yaml",
+                    "configs/config_aspiration_mel_band_roformer-fast.yaml"
+                ],
+                "mel_band_roformer_crowd_aufr33_viperx_sdr_8.7144.ckpt": [
+                    "configs/model_mel_band_roformer_crowd_aufr33_viperx.yaml",
+                    "configs/model_mel_band_roformer_crowd_aufr33_viperx-fast.yaml"
+                ]
             },
             "model_types": {
                 "MelBandRoformer_kim.ckpt": "mel_band_roformer",
@@ -127,37 +177,19 @@ def load_or_create_config():
                 "deverb_mel_band_roformer_8_512dim_12depth.ckpt": "mel_band_roformer",
                 "deverb_mel_band_roformer_ep_27_sdr_10.4567.ckpt": "mel_band_roformer",
                 "denoise_mel_band_roformer_aufr33_sdr_27.9959.ckpt": "mel_band_roformer",
-                "denoise_mel_band_roformer_aufr33_aggr_sdr_27.9768.ckpt": "mel_band_roformer"
+                "denoise_mel_band_roformer_aufr33_aggr_sdr_27.9768.ckpt": "mel_band_roformer",
+                "Apollo_LQ_MP3_restoration.ckpt": "apollo",
+                "aspiration_mel_band_roformer_sdr_18.9845.ckpt": "mel_band_roformer",
+                "aspiration_mel_band_roformer_less_aggr_sdr_18.1201.ckpt": "mel_band_roformer",
+                "mel_band_roformer_crowd_aufr33_viperx_sdr_8.7144.ckpt": "mel_band_roformer"
             },
-            "inference_env": r'.\env\python.exe'
+            "inference_env": ".\\env\\python.exe"
         }
         with open(CONFIG_FILE, 'w') as f:
             json.dump(initial_config, f, indent=4)
 
     with open(CONFIG_FILE, 'r') as f:
         return json.load(f)
-
-
-def organize_instrumental_files(store_dir):
-    instrumental_dir = os.path.join(store_dir, "instrumental")
-    if not os.path.exists(instrumental_dir):
-        os.makedirs(instrumental_dir)
-
-    moved_files = 0
-    start_time = time.time()
-
-    for filename in os.listdir(store_dir):
-        if "_instrumental" in filename.lower():
-            src_path = os.path.join(store_dir, filename)
-            dst_path = os.path.join(instrumental_dir, filename)
-            shutil.move(src_path, dst_path)
-            moved_files += 1
-
-    end_time = time.time()
-    logger.info(f"Organized {moved_files} instrumental files in {store_dir}")
-    logger.info(f"Time taken to organize files: {end_time - start_time:.2f} seconds")
-
-    return moved_files, end_time - start_time
 
 
 class SystemInfoThread(QThread):
@@ -267,7 +299,8 @@ class SystemInfoThread(QThread):
         self.print_with_delay(gpu_warning, color='#ffa500', italic=True)
         self.print_with_delay(ram_warning, color='#ffa500', italic=True)
         self.print_with_delay("=" * 50, color='gray')
-        self.print_with_delay("Github: https://github.com/AliceNavigator/Music-Source-Separation-Training-GUI", color='green', auto_newline=False)
+        self.print_with_delay("Github: https://github.com/AliceNavigator/Music-Source-Separation-Training-GUI",
+                              color='green', auto_newline=False)
 
     @pyqtSlot(str, str, bool, bool, bool, int)
     def print_with_delay(self, text, color='white', bold=False, italic=False, auto_newline=True, delay=10):
@@ -290,7 +323,7 @@ class CustomComboBox(QComboBox):
 
 
 class InferenceThread(QThread):
-    update_signal = pyqtSignal(str, bool)  # bool use for tqdm
+    update_signal = pyqtSignal(str, bool)
     finished_signal = pyqtSignal(dict)
     file_organization_signal = pyqtSignal(int, float)
 
@@ -300,86 +333,160 @@ class InferenceThread(QThread):
         self.input_folder = input_folder
         self.is_running = True
         self.process = None
+        self.process_lock = Lock()
+        self.queue = multiprocessing.Queue()
 
     def run(self):
         start_time = time.time()
         summary = {
             "total_files": 0,
             "modules": [],
-            "errors": 0
+            "errors": 0,
+            "status": "completed"
         }
 
         module_names = {
             "separation_results": "Vocal Model",
             "karaoke_results": "Karaoke Model",
             "deverb_results": "Reverb Model",
-            "denoise_results": "Denoise Model"
+            "other_results": "Other Model"
         }
 
-        total_files = sum(len(files) for _, _, files in os.walk(self.input_folder))
-        summary["total_files"] = total_files
-        logger.info(f"Total files in input folder: {total_files}")
+        try:
+            total_files = sum(len(files) for _, _, files in os.walk(self.input_folder))
+            summary["total_files"] = total_files
+            logger.info(f"Total files in input folder: {total_files}")
 
-        for command, store_dir in self.commands:
-            if not self.is_running:
-                break
-            logger.info(f"Starting inference with command: {command}")
-            self.update_signal.emit(f"MODULE: {module_names[store_dir]}", False)
-            self.update_signal.emit(f"Command: {command}", False)
-            self.process = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                            text=True, universal_newlines=True)
-            for line in self.process.stdout:
+            for args, store_dir in self.commands:
                 if not self.is_running:
+                    summary["status"] = "stopped"
                     break
-                stripped_line = line.strip()
-                if line.startswith('\r') or "it/s]" in line:  # if is tqdm
-                    self.update_signal.emit(stripped_line, True)
-                else:
-                    self.update_signal.emit(stripped_line, False)
-                logger.debug(stripped_line)
-                if "error" in line.lower():
-                    summary["errors"] += 1
-            if self.is_running:
-                self.process.wait()
-                summary["modules"].append((module_names[store_dir], store_dir))
-                logger.info(f"Module {module_names[store_dir]} completed. ")
 
-                # Make sure all files are organized before continuing
-                moved_files, time_taken = organize_instrumental_files(store_dir)
+                logger.info(f"Starting inference with args: {args}")
+                self.update_signal.emit(f"MODULE: {module_names[store_dir]}", False)
+                self.update_signal.emit(f"Args: {args}", False)
+
+                with self.process_lock:
+                    self.process = multiprocessing.Process(target=self.run_inference, args=(args, self.queue))
+                    self.process.start()
+
+                while self.is_running:
+                    with self.process_lock:
+                        if self.process is None or not self.process.is_alive():
+                            break
+                    try:
+                        output, is_progress = self.queue.get(timeout=0.1)
+                        self.update_signal.emit(output, is_progress)
+                    except Empty:
+                        continue
+
+                with self.process_lock:
+                    if self.process:
+                        if self.process.is_alive():
+                            self.process.terminate()
+                            self.process.join(timeout=5)
+                            if self.process.is_alive():
+                                self.process.kill()
+                                self.process.join()
+
+                        if self.process.exitcode != 0:
+                            logger.error(f"Inference process for {store_dir} exited with code {self.process.exitcode}")
+                            summary["errors"] += 1
+                        else:
+                            summary["modules"].append((module_names[store_dir], store_dir))
+                            logger.info(f"Module {store_dir} completed successfully")
+
+                        self.process = None
+
+                moved_files, time_taken = self.organize_instrumental_files(store_dir)
                 self.file_organization_signal.emit(moved_files, time_taken)
 
-            else:
-                self.terminate_process()
-            logger.info(f"Inference process completed or terminated for {module_names[store_dir]}")
-
-        if self.is_running:
+        except Exception as e:
+            logger.error(f"Error in inference thread: {str(e)}")
+            logger.error(traceback.format_exc())
+            summary["status"] = "error"
+            summary["error_message"] = str(e)
+        finally:
+            if summary["status"] == "completed" and not self.is_running:
+                summary["status"] = "stopped"
             summary["total_time"] = time.time() - start_time
             logger.info(
-                f"Inference completed. Total files: {summary['total_files']}, Time: {summary['total_time']:.2f} seconds")
+                f"Inference completed. Status: {summary['status']}, Total files: {summary['total_files']}, Time: {summary['total_time']:.2f} seconds")
             self.finished_signal.emit(summary)
-        else:
-            self.update_signal.emit("Inference process was terminated.", False)
+
+    @staticmethod
+    def run_inference(args, queue):
+        sys.stdout = sys.stderr = OutputRedirector(queue)
+        logger.info(f"Starting inference in subprocess with args: {args}")
+        try:
+            inference_standalone.proc_folder(args)
+            logger.info("Inference subprocess completed successfully")
+        except Exception as e:
+            logger.error(f"Error in inference subprocess: {str(e)}")
+            logger.error(traceback.format_exc())
+        finally:
+            logger.info("Inference subprocess finished")
 
     def stop(self):
+        logger.info("Stopping inference thread")
         self.is_running = False
-        if self.process:
-            self.terminate_process()
+        self.terminate_process()
+        if not self.wait(5000):  # 等待5秒
+            logger.warning("Inference thread did not finish in time, forcing termination")
+            self.terminate()
 
     def terminate_process(self):
         logger.info("Terminating inference process")
-        if self.process:
-            try:
-                parent = psutil.Process(self.process.pid)
-                children = parent.children(recursive=True)
-                for child in children:
-                    child.terminate()
-                parent.terminate()
-                gone, still_alive = psutil.wait_procs(children + [parent], timeout=5)
-                for p in still_alive:
-                    p.kill()
-            except psutil.NoSuchProcess:
-                pass
-        self.process = None
+        with self.process_lock:
+            if self.process:
+                try:
+                    if self.process.is_alive():
+                        self.process.terminate()
+                        self.process.join(timeout=5)
+                        if self.process.is_alive():
+                            self.process.kill()
+                            self.process.join()
+                except Exception as e:
+                    logger.error(f"Error while terminating process: {str(e)}")
+                finally:
+                    self.process = None
+
+    @staticmethod
+    def organize_instrumental_files(store_dir):
+        instrumental_dir = os.path.join(store_dir, "instrumental")
+        if not os.path.exists(instrumental_dir):
+            os.makedirs(instrumental_dir)
+
+        moved_files = 0
+        start_time = time.time()
+        inst_lower = ['_instrumental', '_aspiration']
+
+        for filename in os.listdir(store_dir):
+            for lower in inst_lower:
+                if lower in filename.lower():
+                    src_path = os.path.join(store_dir, filename)
+                    dst_path = os.path.join(instrumental_dir, filename)
+                    shutil.move(src_path, dst_path)
+                    moved_files += 1
+
+        end_time = time.time()
+        logger.info(f"Organized {moved_files} instrumental files in {store_dir}")
+        logger.info(f"Time taken to organize files: {end_time - start_time:.2f} seconds")
+
+        return moved_files, end_time - start_time
+
+
+class OutputRedirector:
+    def __init__(self, queue):
+        self.queue = queue
+
+    def write(self, msg):
+        if msg.strip():
+            is_progress = msg.startswith('\r') and ('it/s]' in msg or '% Complete' in msg)
+            self.queue.put((msg.strip(), is_progress))
+
+    def flush(self):
+        pass
 
 
 class ModelEditDialog(QDialog):
@@ -538,8 +645,8 @@ class ConfigEditorDialog(QDialog):
         self.setup_ui()
 
     @staticmethod
-    def validate_config( config):
-        model_types = ["vocal_models", "kara_models", "reverb_models", "denoise_models"]
+    def validate_config(config):
+        model_types = ["vocal_models", "kara_models", "reverb_models", "other_models"]
         for model_type in model_types:
             if model_type not in config:
                 config[model_type] = {}
@@ -558,7 +665,7 @@ class ConfigEditorDialog(QDialog):
             self.set_background_image()
             self.apply_styles()
 
-            for model_type in ["vocal_models", "kara_models", "reverb_models", "denoise_models"]:
+            for model_type in ["vocal_models", "kara_models", "reverb_models", "other_models"]:
                 tab = QWidget()
                 tab_layout = QVBoxLayout(tab)
                 table = QTableWidget()
@@ -704,7 +811,6 @@ class ConfigEditorDialog(QDialog):
                 # Update the config
                 self.update_config_from_table(table, model_type)
 
-                # Log the move operation
                 logger.info(f"Moved row {row} to {new_row} in {model_type}")
         except Exception as e:
             logger.error(f"Error in move_row: {str(e)}")
@@ -736,7 +842,7 @@ class ConfigEditorDialog(QDialog):
                 if "config_paths" not in self.working_config:
                     self.working_config["config_paths"] = {}
                 self.working_config["config_paths"][model_name] = [updated_info["config_path"],
-                                                           updated_info["fast_config_path"]]
+                                                                   updated_info["fast_config_path"]]
                 if "model_types" not in self.working_config:
                     self.working_config["model_types"] = {}
                 self.working_config["model_types"][model_name] = updated_info["model_type"]
@@ -777,7 +883,8 @@ class ConfigEditorDialog(QDialog):
                     self.working_config[model_type][model_name] = updated_info["description"]
                     if "config_paths" not in self.working_config:
                         self.working_config["config_paths"] = {}
-                    self.working_config["config_paths"][model_name] = [updated_info["config_path"], updated_info["fast_config_path"]]
+                    self.working_config["config_paths"][model_name] = [updated_info["config_path"],
+                                                                       updated_info["fast_config_path"]]
                     if "model_types" not in self.working_config:
                         self.working_config["model_types"] = {}
                     self.working_config["model_types"][model_name] = updated_info["model_type"]
@@ -876,13 +983,13 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.background_label = None
         self.inference_thread = None
-        self.setWindowTitle("MSST GUI v1.3     by 领航员未鸟")
+        self.setWindowTitle("MSST GUI Standalone version v1.3.1     by 领航员未鸟")
         self.setGeometry(100, 100, 800, 800)
         self.setWindowIcon(QIcon(":/images/msst-icon.ico"))
         self.setFont(QApplication.font())
         if sys.platform == 'win32':
             import ctypes
-            myappid = 'AliceNavigator.msst-GUI.v1.3'
+            myappid = 'AliceNavigator.msst-GUI-Standalone.v1.3.1'
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
 
         self.config = load_or_create_config()
@@ -937,10 +1044,10 @@ class MainWindow(QMainWindow):
         model_layout.addLayout(
             self.create_model_section("Reverb Model:", self.reverb_model_combo, self.reverb_model_tooltip))
 
-        self.denoise_model_combo = self.create_model_combo(self.config["denoise_models"])
-        self.denoise_model_tooltip = self.create_tooltip_label()
+        self.other_model_combo = self.create_model_combo(self.config["other_models"])
+        self.other_model_tooltip = self.create_tooltip_label()
         model_layout.addLayout(
-            self.create_model_section("Denoise Model:", self.denoise_model_combo, self.denoise_model_tooltip))
+            self.create_model_section("Other Model:", self.other_model_combo, self.other_model_tooltip))
 
         self.update_model_combos()
         main_layout.addWidget(model_group)
@@ -962,7 +1069,8 @@ class MainWindow(QMainWindow):
         left_options.addWidget(self.force_cpu_checkbox)
 
         self.use_tta_checkbox = QCheckBox("Use TTA")
-        self.use_tta_checkbox.setToolTip("Use test time augmentation(TTA). While this triples the runtime, it reduces noise and slightly improves prediction quality.")
+        self.use_tta_checkbox.setToolTip(
+            "Use test time augmentation(TTA). While this triples the runtime, it reduces noise and slightly improves prediction quality.")
         left_options.addWidget(self.use_tta_checkbox)
 
         options_layout.addLayout(left_options)
@@ -972,33 +1080,12 @@ class MainWindow(QMainWindow):
         right_options = QHBoxLayout()
         right_options.setSpacing(5)  # Kept the reduced spacing between elements on the right
 
-        env_input_label = QLabel("Inference Env:")
-        right_options.addWidget(env_input_label)
-
-        self.inference_env_input = QLineEdit()
-        self.inference_env_input.setPlaceholderText("Path to Python executable")
-        self.inference_env_input.setText(r'.\env\python.exe')
-        self.inference_env_input.setToolTip("Path to Python executable for inference")
-        self.inference_env_input.setFixedWidth(200)  # Kept the adjusted width
-        right_options.addWidget(self.inference_env_input)
-
-        self.browse_button = QToolButton()
-        self.browse_button.setIcon(QIcon(":/images/hammer-and-anvil.png"))
-        self.browse_button.setIconSize(QSize(24, 24))
-        self.browse_button.setToolTip("Browse for Python executable")
-        self.browse_button.clicked.connect(self.browse_inference_env)
-        right_options.addWidget(self.browse_button)
+        # env_input_label = QLabel("Built-in environment")
+        # right_options.addWidget(env_input_label)
 
         options_layout.addLayout(right_options)
 
         main_layout.addLayout(options_layout)
-
-        self.inference_env_input.setObjectName("inference_env_input")
-        self.browse_button.setObjectName("browse_button")
-
-        # Connect the textChanged signal to save the inference env
-        self.inference_env_input.setText(self.config.get("inference_env", r'.\env\python.exe'))
-        self.inference_env_input.textChanged.connect(self.save_inference_env)
 
         # Input folder selection
         folder_layout = QHBoxLayout()
@@ -1090,14 +1177,14 @@ class MainWindow(QMainWindow):
             lambda: self.update_tooltip(self.kara_model_combo, self.kara_model_tooltip))
         self.reverb_model_combo.currentIndexChanged.connect(
             lambda: self.update_tooltip(self.reverb_model_combo, self.reverb_model_tooltip))
-        self.denoise_model_combo.currentIndexChanged.connect(
-            lambda: self.update_tooltip(self.denoise_model_combo, self.denoise_model_tooltip))
+        self.other_model_combo.currentIndexChanged.connect(
+            lambda: self.update_tooltip(self.other_model_combo, self.other_model_tooltip))
 
         # Initial tooltip update
         self.update_tooltip(self.vocal_model_combo, self.vocal_model_tooltip)
         self.update_tooltip(self.kara_model_combo, self.kara_model_tooltip)
         self.update_tooltip(self.reverb_model_combo, self.reverb_model_tooltip)
-        self.update_tooltip(self.denoise_model_combo, self.denoise_model_tooltip)
+        self.update_tooltip(self.other_model_combo, self.other_model_tooltip)
 
         # Set styles
         self.setStyleSheet("""
@@ -1215,34 +1302,6 @@ class MainWindow(QMainWindow):
 
         logger.info("MainWindow initialization completed")
 
-    def check_inference_env(self):
-        inference_env = self.inference_env_input.text().strip()
-        if inference_env.lower() == 'python':
-            # If set to use system Python, check if it's available
-            try:
-                subprocess.run(['python', '--version'], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                logger.info("Using system Python for inference")
-            except subprocess.CalledProcessError:
-                logger.error("System Python not found")
-                QMessageBox.warning(self, "Error", "System Python not found. Please install Python or set the correct path in the configuration.")
-                return False
-        elif not os.path.exists(inference_env):
-            logger.error(f"Inference environment not found: {inference_env}")
-            QMessageBox.warning(self, "Error", f"Inference environment not found: {inference_env}\nPlease check your configuration and ensure the path is correct.")
-            return False
-        return True
-
-    def save_inference_env(self):
-        inference_env = self.inference_env_input.text().strip()
-        self.config["inference_env"] = inference_env
-        self.save_env_config()
-        logger.info(f"Saved inference env: {inference_env}")
-
-    def save_env_config(self):
-        with open(CONFIG_FILE, 'w') as f:
-            json.dump(self.config, f, indent=4)
-        logger.info("Inference env configuration saved")
-
     @staticmethod
     def create_model_combo(options):
         combo = CustomComboBox()
@@ -1285,18 +1344,12 @@ class MainWindow(QMainWindow):
     def create_model_section(label_text, combo, tooltip_label):
         layout = QVBoxLayout()
         label = QLabel(label_text)
-        label.setStyleSheet("font-weight: bold; font-size: 10pt;")
+        label.setStyleSheet("font-size: 10pt;")
         layout.addWidget(label)
         layout.addWidget(combo)
         layout.addWidget(tooltip_label)
         layout.addSpacing(10)  # Add some space between sections
         return layout
-
-    def browse_inference_env(self):
-        file_path, _ = QFileDialog.getOpenFileName(self, "Select Python Executable", "", "Python Executable (*.exe);;All Files (*)")
-        if file_path:
-            self.inference_env_input.setText(file_path)
-            self.save_inference_env()
 
     @staticmethod
     def update_tooltip(combo, tooltip_scroll_area):
@@ -1394,7 +1447,7 @@ class MainWindow(QMainWindow):
             self.vocal_model_combo.setCurrentText(self.convert_false_to_none(preset["vocal_model_name"]))
             self.kara_model_combo.setCurrentText(self.convert_false_to_none(preset["kara_model_name"]))
             self.reverb_model_combo.setCurrentText(self.convert_false_to_none(preset["reverb_model_name"]))
-            self.denoise_model_combo.setCurrentText(self.convert_false_to_none(preset["denoise_model_name"]))
+            self.other_model_combo.setCurrentText(self.convert_false_to_none(preset["other_model_name"]))
             self.fast_inference_checkbox.setChecked(preset.get("if_fast", True))
             self.force_cpu_checkbox.setChecked(preset.get("force_cpu", False))
             self.use_tta_checkbox.setChecked(preset.get("use_tta", False))
@@ -1415,7 +1468,7 @@ class MainWindow(QMainWindow):
                     "vocal_model_name": self.convert_none_to_false(self.vocal_model_combo.currentText()),
                     "kara_model_name": self.convert_none_to_false(self.kara_model_combo.currentText()),
                     "reverb_model_name": self.convert_none_to_false(self.reverb_model_combo.currentText()),
-                    "denoise_model_name": self.convert_none_to_false(self.denoise_model_combo.currentText()),
+                    "other_model_name": self.convert_none_to_false(self.other_model_combo.currentText()),
                     "if_fast": self.fast_inference_checkbox.isChecked(),
                     "force_cpu": self.force_cpu_checkbox.isChecked(),
                     "use_tta": self.use_tta_checkbox.isChecked(),
@@ -1447,17 +1500,12 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def safe_path(path):
+        path = path.strip("'\"")
         path = os.path.normpath(path)
-        path = path.replace('"', '\\"')
-        return f'"{path}"'
+        return shlex.quote(path) if ' ' in path else path
 
     def run_inference(self):
         logger.info("Starting inference process")
-        inference_env = self.inference_env_input.text().strip()
-
-        # Check inference environment before proceeding
-        if not self.check_inference_env():
-            return
 
         if not os.path.exists(self.input_folder):
             logger.warning("Input folder does not exist")
@@ -1469,7 +1517,6 @@ class MainWindow(QMainWindow):
                                 "The input folder is empty. Please add some audio files and try again.")
             return
 
-        inference_base = inference_env + ' inference.py'
         fast_inference = self.fast_inference_checkbox.isChecked()
         force_cpu = self.force_cpu_checkbox.isChecked()
         use_tta = self.use_tta_checkbox.isChecked()
@@ -1479,31 +1526,41 @@ class MainWindow(QMainWindow):
         def add_command(model, store_dir):
             nonlocal current_input_folder
             if model != "None":
-                config_path = self.safe_path(self.get_config_path(model, fast_inference))
+                config_path = self.get_config_path(model, fast_inference)
                 model_type = self.get_model_type(model)
-                model_path = self.safe_path(f"pretrain/{model}")
+                model_path = f"pretrain/{model}"
+
                 if config_path and model_type != "unknown":
-                    cmd = f"{inference_base} --model_type {model_type} --start_check_point {model_path} --input_folder {current_input_folder} --store_dir {store_dir} --extract_instrumental --config_path {config_path}"
+                    args = [
+                        "--start_check_point", self.safe_path(os.path.join("pretrain", model)),
+                        "--model_type", model_type,
+                        "--config_path", self.safe_path(config_path),
+                        "--input_folder", current_input_folder,
+                        "--store_dir", store_dir,
+                        "--extract_instrumental"
+                    ]
+
                     if force_cpu:
-                        cmd += " --force_cpu"
+                        args.append("--force_cpu")
                     if use_tta:
-                        cmd += " --use_tta"
-                    commands.append((cmd, store_dir))
+                        args.append("--use_tta")
+
+                    commands.append((args, store_dir))
                     current_input_folder = store_dir
-                    logger.info(f"Added command for {model}: {cmd}")
+                    logger.info(f"Added command for {model}: {args}")
                 else:
                     logger.warning(f"No config file or unknown model type for model: {model}")
 
         add_command(self.vocal_model_combo.currentText(), "separation_results")
         add_command(self.kara_model_combo.currentText(), "karaoke_results")
         add_command(self.reverb_model_combo.currentText(), "deverb_results")
-        add_command(self.denoise_model_combo.currentText(), "denoise_results")
+        add_command(self.other_model_combo.currentText(), "other_results")
 
         logger.info(f"Inference commands: {commands}")
 
         self.output_console.clear()
         self.update_output("Starting inference...", color='cyan')
-        # self.print_separator()
+
         self.inference_thread = InferenceThread(commands, self.input_folder)
         self.inference_thread.update_signal.connect(self.process_inference_output)
         self.inference_thread.finished_signal.connect(self.inference_finished)
@@ -1541,11 +1598,9 @@ class MainWindow(QMainWindow):
     def stop_inference(self):
         if hasattr(self, 'inference_thread') and self.inference_thread.isRunning():
             logger.info("Stopping inference process")
-            self.inference_thread.stop()
             self.update_output("\nStopping inference process. Please wait...", color='yellow')
-            self.inference_thread.wait()
-            self.update_output("Inference process stopped by user.", color='yellow')
-            self.reset_run_button()
+            self.inference_thread.stop()
+        self.reset_run_button()
 
     def reset_run_button(self):
         self.run_button.setText("Run Inference")
@@ -1558,20 +1613,48 @@ class MainWindow(QMainWindow):
         cursor.movePosition(QTextCursor.End)
 
         if is_progress_update:
+            console_width = self.output_console.width() // 8
+            percentage_match = re.search(r'(\d+)%', text)
+            percentage = int(percentage_match.group(1)) if percentage_match else 0
+
+            bar_length = console_width - 45  # Adjust display length
+            filled_length = int(bar_length * percentage / 100)
+            bar = "█" * filled_length + "-" * (bar_length - filled_length)
+
+            iterations_match = re.search(r'(\d+)/(\d+)', text)
+            iterations_info = f"{iterations_match.group(1)}/{iterations_match.group(2)}" if iterations_match else ""
+
+            speed_match = re.search(r'(\d+\.\d+)it/s', text)
+            speed = speed_match.group(0) if speed_match else ""
+
+            new_text = f"\rProcessing: |{bar}| {percentage:3d}% {iterations_info} {speed}"
+            strip_text = new_text.strip()
+
             cursor.movePosition(QTextCursor.StartOfLine, QTextCursor.KeepAnchor)
             cursor.removeSelectedText()
-            self.update_output(text, color='#ffa500', auto_newline=False)
+            self.update_output(strip_text, color='#ffa500', auto_newline=False)
+
+            if iterations_info == '':
+                new_text = f"\rProcessing: |" + "█" * bar_length + f"| 100% {speed} Complete!"
+                strip_text = new_text.strip()
+                cursor.movePosition(QTextCursor.StartOfLine, QTextCursor.KeepAnchor)
+                cursor.removeSelectedText()
+                self.update_output(strip_text, color='#ffa500', auto_newline=False)
+                self.update_output("\n", auto_newline=False)
+
         else:
             if text.startswith("MODULE:"):
                 self.print_separator(char='=')
                 self.update_output(text, color='#6e71ff', bold=True)
-            elif text.startswith("Command:"):
+            elif text.startswith("Args:"):
                 self.update_output(text, color='yellow', italic=True)
                 self.print_separator(char='-')
             elif "error" in text.lower():
                 self.update_output(text, color='red')
             elif "warning" in text.lower():
                 self.update_output(text, color='orange')
+            elif text.startswith("Starting processing track:"):
+                self.update_output("\n" + text, color='#00ff00')
             else:
                 self.update_output(text)
 
@@ -1581,7 +1664,16 @@ class MainWindow(QMainWindow):
     def inference_finished(self, summary):
         self.reset_run_button()
         self.print_separator(char='=')
-        self.update_output("Inference process completed!", color='green', bold=True)
+        if summary["status"] == "completed":
+            self.update_output("Inference process completed successfully!", color='green', bold=True)
+        elif summary["status"] == "stopped":
+            self.update_output("Inference process stopped by user.", color='yellow', bold=True)
+        elif summary["status"] == "error":
+            self.update_output("Inference process failed!", color='red', bold=True)
+            self.update_output(f"Error: {summary.get('error_message', 'Unknown error')}", color='red')
+        else:
+            self.update_output("Inference process finished with unknown status.", color='orange', bold=True)
+
         self.print_separator(char='=')
         self.update_output("Summary:", color='#6e71ff', bold=True)
         self.update_output(f"Total files processed: {summary['total_files']}", color='#6e71ff')
@@ -1591,8 +1683,8 @@ class MainWindow(QMainWindow):
             self.update_output(f"- {module_name}: {store_dir} ", color='#6e71ff')
         if summary['errors'] > 0:
             self.update_output(f"Errors encountered: {summary['errors']}", color='red')
-        self.print_separator(char='=')
-        logger.info(f"Inference summary displayed. Total files: {summary['total_files']}")
+        # self.print_separator(char='=')
+        logger.info(f"Inference summary displayed. Status: {summary['status']}, Total files: {summary['total_files']}")
 
     def update_output(self, text, color='white', bold=False, italic=False, auto_newline=True):
         cursor = self.output_console.textCursor()
@@ -1603,7 +1695,7 @@ class MainWindow(QMainWindow):
         if italic:
             format.setFontItalic(True)
         cursor.movePosition(QTextCursor.End)
-        cursor.insertText(text + ('\n' if auto_newline else ''), format)
+        cursor.insertText(text + ('\n' if auto_newline and not text.startswith("\r") else ''), format)
         self.output_console.setTextCursor(cursor)
         self.output_console.ensureCursorVisible()
 
@@ -1637,7 +1729,7 @@ class MainWindow(QMainWindow):
         self.update_single_combo(self.vocal_model_combo, self.vocal_model_tooltip, self.config["vocal_models"])
         self.update_single_combo(self.kara_model_combo, self.kara_model_tooltip, self.config["kara_models"])
         self.update_single_combo(self.reverb_model_combo, self.reverb_model_tooltip, self.config["reverb_models"])
-        self.update_single_combo(self.denoise_model_combo, self.denoise_model_tooltip, self.config["denoise_models"])
+        self.update_single_combo(self.other_model_combo, self.other_model_tooltip, self.config["other_models"])
 
     def update_single_combo(self, combo, tooltip_label, options):
         current_text = combo.currentText()
